@@ -30,7 +30,14 @@ API_KEY = _resolve_file_env("OPEN_TERMINAL_API_KEY")
 CORS_ALLOWED_ORIGINS = os.environ.get("OPEN_TERMINAL_CORS_ALLOWED_ORIGINS", "*")
 LOG_DIR = os.environ.get(
     "OPEN_TERMINAL_LOG_DIR",
-    os.path.join(os.path.expanduser("~"), ".open-terminal", "logs"),
+    os.path.join(
+        os.environ.get(
+            "XDG_STATE_HOME",
+            os.path.join(os.path.expanduser("~"), ".local", "state"),
+        ),
+        "open-terminal",
+        "logs",
+    ),
 )
 
 # Comma-separated mime type prefixes for binary files that read_file will return
