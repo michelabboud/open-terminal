@@ -16,6 +16,13 @@ try:
 except ImportError:
     _PTY_AVAILABLE = False  # Windows
 
+try:
+    from winpty import PtyProcess as WinPtyProcess
+
+    _WINPTY_AVAILABLE = True
+except ImportError:
+    _WINPTY_AVAILABLE = False
+
 
 class ProcessRunner(ABC):
     """Unified interface for running a subprocess via PTY or pipes."""
@@ -180,10 +187,90 @@ class PipeRunner(ProcessRunner):
         return self._process.pid
 
 
+class WinPtyRunner(ProcessRunner):
+    """Spawn a command under a Windows pseudo-terminal (ConPTY via pywinpty)."""
+
+    def __init__(self, command: str, cwd: str | None, env: dict | None):
+        spawn_env = os.environ.copy()
+        if env:
+            spawn_env.update(env)
+
+        # Determine the executable and arguments.
+        # PtyProcess.spawn expects a list: [executable, *args]
+        shell = spawn_env.get("COMSPEC", "cmd.exe")
+        cmd_args = [shell, "/c", command] if command else [shell]
+
+        self._pty = WinPtyProcess.spawn(
+            cmd_args,
+            cwd=cwd,
+            env=spawn_env,
+            dimensions=(24, 80),
+        )
+
+    async def read_output(self, log_file) -> None:
+        loop = asyncio.get_event_loop()
+
+        def _read_blocking():
+            try:
+                return self._pty.read(4096)
+            except EOFError:
+                return ""
+            except Exception:
+                return ""
+
+        while True:
+            data = await loop.run_in_executor(None, _read_blocking)
+            if not data:
+                if not self._pty.isalive():
+                    break
+                await asyncio.sleep(0.05)
+                continue
+            if log_file:
+                await log_file.write(
+                    json.dumps(
+                        {
+                            "type": "output",
+                            "data": data,
+                            "ts": time.time(),
+                        }
+                    )
+                    + "\n"
+                )
+                await log_file.flush()
+
+    def write_input(self, data: bytes) -> None:
+        self._pty.write(data.decode(errors="replace"))
+
+    def kill(self, force: bool = False) -> None:
+        if force:
+            self._pty.kill(signal.SIGKILL)
+        else:
+            self._pty.terminate()
+
+    async def wait(self) -> int:
+        while self._pty.isalive():
+            await asyncio.sleep(0.1)
+        return self._pty.exitstatus or 0
+
+    def close(self) -> None:
+        if self._pty.isalive():
+            self._pty.terminate()
+
+    @property
+    def pid(self) -> int:
+        return self._pty.pid
+
+    def set_size(self, rows: int, cols: int) -> None:
+        """Resize the pseudo-terminal window."""
+        self._pty.setwinsize(rows, cols)
+
+
 async def create_runner(command: str, cwd: str | None, env: dict | None) -> ProcessRunner:
-    """Factory: create a PTY runner on Unix, pipe runner on Windows."""
+    """Factory: create a PTY runner on Unix, WinPTY runner on Windows, or pipe fallback."""
     if _PTY_AVAILABLE:
         return PtyRunner(command, cwd, env)
+    if _WINPTY_AVAILABLE:
+        return WinPtyRunner(command, cwd, env)
     runner = PipeRunner(command, cwd, env)
     await runner.start()
     return runner

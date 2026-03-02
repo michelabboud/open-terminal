@@ -69,7 +69,7 @@ async def verify_api_key(
 app = FastAPI(
     title="Open Terminal",
     description="A remote terminal API.",
-    version="0.7.2",
+    version="0.8.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -1114,11 +1114,26 @@ async def kill_process(
 # Interactive terminal sessions (resource-oriented API)
 # ---------------------------------------------------------------------------
 
-import select
 import uuid as _uuid
 from datetime import datetime as _datetime
 
-# Active terminal sessions: {id: {master_fd, process, created_at, pid}}
+try:
+    import select as _select
+except ImportError:
+    _select = None  # Not available on all platforms in all contexts
+
+# Determine terminal backend: prefer Unix PTY, then pywinpty, else None
+if _PTY_AVAILABLE:
+    _TERMINAL_BACKEND = "pty"
+else:
+    try:
+        from winpty import PtyProcess as _WinPtyProcess
+
+        _TERMINAL_BACKEND = "winpty"
+    except ImportError:
+        _TERMINAL_BACKEND = None
+
+# Active terminal sessions: {id: {...}}
 _terminal_sessions: dict[str, dict] = {}
 
 
@@ -1127,30 +1142,42 @@ def _cleanup_session(session_id: str):
     session = _terminal_sessions.pop(session_id, None)
     if session is None:
         return
-    try:
-        os.close(session["master_fd"])
-    except OSError:
-        pass
-    process = session["process"]
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
 
+    backend = session.get("backend")
+
+    if backend == "pty":
+        try:
+            os.close(session["master_fd"])
+        except OSError:
+            pass
+        process = session["process"]
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    elif backend == "winpty":
+        pty_proc = session["pty_process"]
+        if pty_proc.isalive():
+            pty_proc.terminate()
 
 
 @app.post("/api/terminals", dependencies=[Depends(verify_api_key)], include_in_schema=False)
 async def create_terminal(request: Request):
     """Create a new terminal session and return its ID."""
-    if not _PTY_AVAILABLE:
+    if _TERMINAL_BACKEND is None:
         return JSONResponse(
-            {"error": "PTY not available on this platform"}, status_code=503
+            {"error": "PTY not available on this platform (install pywinpty on Windows)"},
+            status_code=503,
         )
 
     # Prune dead sessions before checking limit
-    dead = [sid for sid, s in _terminal_sessions.items() if s["process"].poll() is not None]
+    if _TERMINAL_BACKEND == "pty":
+        dead = [sid for sid, s in _terminal_sessions.items() if s["process"].poll() is not None]
+    else:
+        dead = [sid for sid, s in _terminal_sessions.items() if not s["pty_process"].isalive()]
     for sid in dead:
         _cleanup_session(sid)
 
@@ -1162,49 +1189,75 @@ async def create_terminal(request: Request):
 
     session_id = str(_uuid.uuid4())[:8]
 
-    try:
-        master_fd, slave_fd = pty.openpty()
-    except OSError:
-        return JSONResponse(
-            {"error": "Out of PTY devices — too many active terminals or processes"},
-            status_code=503,
-        )
+    if _TERMINAL_BACKEND == "pty":
+        try:
+            master_fd, slave_fd = pty.openpty()
+        except OSError:
+            return JSONResponse(
+                {"error": "Out of PTY devices — too many active terminals or processes"},
+                status_code=503,
+            )
 
-    try:
-        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        try:
+            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
 
-        shell = os.environ.get("SHELL", "/bin/sh")
-        process = subprocess.Popen(
+            shell = os.environ.get("SHELL", "/bin/sh")
+            process = subprocess.Popen(
+                [shell],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=os.getcwd(),
+                env=os.environ.copy(),
+                start_new_session=True,
+            )
+        except Exception:
+            os.close(slave_fd)
+            os.close(master_fd)
+            raise
+        os.close(slave_fd)
+
+        # Set non-blocking
+        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        _terminal_sessions[session_id] = {
+            "backend": "pty",
+            "master_fd": master_fd,
+            "process": process,
+            "created_at": _datetime.utcnow().isoformat() + "Z",
+            "pid": process.pid,
+        }
+
+    else:  # winpty
+        shell = os.environ.get("COMSPEC", "cmd.exe")
+        pty_proc = _WinPtyProcess.spawn(
             [shell],
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
             cwd=os.getcwd(),
             env=os.environ.copy(),
-            start_new_session=True,
+            dimensions=(24, 80),
         )
-    except Exception:
-        os.close(slave_fd)
-        os.close(master_fd)
-        raise
-    os.close(slave_fd)
+        _terminal_sessions[session_id] = {
+            "backend": "winpty",
+            "pty_process": pty_proc,
+            "created_at": _datetime.utcnow().isoformat() + "Z",
+            "pid": pty_proc.pid,
+        }
 
-    # Set non-blocking
-    flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
-    fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-    _terminal_sessions[session_id] = {
-        "master_fd": master_fd,
-        "process": process,
-        "created_at": _datetime.utcnow().isoformat() + "Z",
-        "pid": process.pid,
-    }
-
+    session = _terminal_sessions[session_id]
     return {
         "id": session_id,
-        "created_at": _terminal_sessions[session_id]["created_at"],
-        "pid": process.pid,
+        "created_at": session["created_at"],
+        "pid": session["pid"],
     }
+
+
+def _session_is_alive(session: dict) -> bool:
+    """Check if a terminal session's process is still running."""
+    if session["backend"] == "pty":
+        return session["process"].poll() is None
+    else:
+        return session["pty_process"].isalive()
 
 
 @app.get("/api/terminals", dependencies=[Depends(verify_api_key)], include_in_schema=False)
@@ -1213,7 +1266,7 @@ async def list_terminals(request: Request):
     result = []
     to_remove = []
     for sid, session in _terminal_sessions.items():
-        if session["process"].poll() is not None:
+        if not _session_is_alive(session):
             to_remove.append(sid)
             continue
         result.append({
@@ -1232,7 +1285,7 @@ async def get_terminal(session_id: str, request: Request):
     session = _terminal_sessions.get(session_id)
     if session is None:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    if session["process"].poll() is not None:
+    if not _session_is_alive(session):
         _cleanup_session(session_id)
         return JSONResponse({"error": "Session not found"}, status_code=404)
     return {
@@ -1273,7 +1326,7 @@ async def ws_terminal(ws: WebSocket, session_id: str):
         await ws.close(code=4004, reason="Session not found")
         return
 
-    if session["process"].poll() is not None:
+    if not _session_is_alive(session):
         _cleanup_session(session_id)
         await ws.close(code=4004, reason="Session has ended")
         return
@@ -1292,21 +1345,63 @@ async def ws_terminal(ws: WebSocket, session_id: str):
             await ws.close(code=4001, reason="Auth timeout or invalid payload")
             return
 
-    master_fd = session["master_fd"]
-    process = session["process"]
+    backend = session["backend"]
     loop = asyncio.get_event_loop()
     stop_event = asyncio.Event()
 
-    def _blocking_read():
-        """Read from PTY using select() so we don't block forever."""
-        while not stop_event.is_set():
+    # --- Platform-specific read/write/resize helpers ---
+
+    if backend == "pty":
+        master_fd = session["master_fd"]
+        process = session["process"]
+
+        def _blocking_read():
+            """Read from PTY using select() so we don't block forever."""
+            while not stop_event.is_set():
+                try:
+                    rlist, _, _ = _select.select([master_fd], [], [], 0.1)
+                    if rlist:
+                        return os.read(master_fd, 4096)
+                except (OSError, ValueError):
+                    return b""
+            return b""
+
+        def _check_alive():
+            return process.poll() is None
+
+        def _write_data(data: bytes):
+            os.write(master_fd, data)
+
+        def _do_resize(rows: int, cols: int):
+            fcntl.ioctl(
+                master_fd,
+                termios.TIOCSWINSZ,
+                struct.pack("HHHH", rows, cols, 0, 0),
+            )
+
+    else:  # winpty
+        pty_proc = session["pty_process"]
+
+        def _blocking_read():
+            """Read from WinPTY process."""
             try:
-                rlist, _, _ = select.select([master_fd], [], [], 0.1)
-                if rlist:
-                    return os.read(master_fd, 4096)
-            except (OSError, ValueError):
+                data = pty_proc.read(4096)
+                return data.encode(errors="replace") if data else b""
+            except EOFError:
                 return b""
-        return b""
+            except Exception:
+                return b""
+
+        def _check_alive():
+            return pty_proc.isalive()
+
+        def _write_data(data: bytes):
+            pty_proc.write(data.decode(errors="replace"))
+
+        def _do_resize(rows: int, cols: int):
+            pty_proc.setwinsize(rows, cols)
+
+    # --- Reader / writer tasks ---
 
     async def _pty_reader():
         """Forward PTY output -> WebSocket."""
@@ -1316,7 +1411,7 @@ async def ws_terminal(ws: WebSocket, session_id: str):
                 if not data:
                     if stop_event.is_set():
                         break
-                    if process.poll() is not None:
+                    if not _check_alive():
                         break
                     continue
                 try:
@@ -1334,18 +1429,14 @@ async def ws_terminal(ws: WebSocket, session_id: str):
             if msg["type"] == "websocket.disconnect":
                 break
             elif "bytes" in msg and msg["bytes"]:
-                await loop.run_in_executor(None, os.write, master_fd, msg["bytes"])
+                await loop.run_in_executor(None, _write_data, msg["bytes"])
             elif "text" in msg and msg["text"]:
                 try:
                     payload = json.loads(msg["text"])
                     if payload.get("type") == "resize":
                         cols = payload.get("cols", 80)
                         rows = payload.get("rows", 24)
-                        fcntl.ioctl(
-                            master_fd,
-                            termios.TIOCSWINSZ,
-                            struct.pack("HHHH", rows, cols, 0, 0),
-                        )
+                        _do_resize(rows, cols)
                 except (json.JSONDecodeError, KeyError):
                     pass
     except WebSocketDisconnect:
@@ -1359,3 +1450,4 @@ async def ws_terminal(ws: WebSocket, session_id: str):
             pass
         # Clean up session on disconnect
         _cleanup_session(session_id)
+
